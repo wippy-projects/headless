@@ -4,7 +4,6 @@ namespace: headless
 entries:
   - name: definition
     kind: ns.definition
-    readme: file://README.md
     meta:
       title: Headless Browser SDK
       description: Low-level browser automation via Chrome DevTools Protocol
