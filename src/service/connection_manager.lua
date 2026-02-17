@@ -156,6 +156,50 @@ local function main(config)
     local active_tab_count = 0
     -- Waiters queue: list of { options, sender } waiting for a tab slot
     local waiters = {}
+    -- Pending async commands: CDP command ID → { sender, method }
+    local pending = {}
+
+    --- Route a CDP response to the pending async command that sent it.
+    --- Replies to the tab's sender process and removes from pending.
+    local function route_response(resp: table)
+        local cmd_id = resp.id
+        local cmd = pending[cmd_id]
+        if not cmd then return end
+        pending[cmd_id] = nil
+
+        if resp.type == "error" then
+            local cdp_err = resp.error or {}
+            pcall(function()
+                process.send(cmd.sender, "tab.command.reply", {
+                    result = nil,
+                    error = "CDP error (" .. tostring(cdp_err.code) .. "): " .. tostring(cdp_err.message),
+                })
+            end)
+        else
+            pcall(function()
+                process.send(cmd.sender, "tab.command.reply", { result = resp.result, error = nil })
+            end)
+        end
+    end
+
+    --- Drain any responses buffered during a blocking conn:send() call
+    --- and route them to their pending async commands.
+    local function drain_buffered()
+        for _, resp in ipairs(conn:drain_responses()) do
+            route_response(resp :: table)
+        end
+    end
+
+    --- Fail all pending async commands with an error message.
+    --- Used on disconnect/shutdown.
+    local function fail_all_pending(error_msg: string)
+        for _, cmd in pairs(pending) do
+            pcall(function()
+                process.send(cmd.sender :: string, "tab.command.reply", { result = nil, error = error_msg })
+            end)
+        end
+        pending = {}
+    end
 
     local ch_create = process.listen("tab.create")
     local ch_command = process.listen("tab.command")
@@ -304,17 +348,23 @@ local function main(config)
         local r = channel.select(cases)
 
         if r.channel == ws_ch then
-            -- WebSocket message: pump it through CDP connection to dispatch events
+            -- WebSocket message: dispatch events, route responses to pending commands
             if r.ok then
-                conn:pump_message(r.value)
+                local resp = conn:pump_message(r.value)
+                if resp then
+                    route_response(resp :: table)
+                end
             end
 
         elseif r.channel == health_timer then
             -- Periodic health check: verify Chrome connection
             if conn:is_alive() then
                 local _, hc_err = conn:send("Browser.getVersion", nil, nil, "5s")
+                drain_buffered()
                 if hc_err then
                     log:error("Chrome health check failed", { error = tostring(hc_err) })
+                    -- Fail all pending async commands
+                    fail_all_pending("CDP_DISCONNECTED: Chrome connection lost")
                     -- Invalidate all tabs
                     for sid, info in pairs(tabs) do
                         if info.event_ch then
@@ -367,6 +417,8 @@ local function main(config)
                 log:info("Shutting down, closing all tabs", {
                     active_tabs = active_tab_count,
                 })
+                -- Fail all pending async commands
+                fail_all_pending("CDP_DISCONNECTED: Manager shutting down")
                 for sid, _ in pairs(tabs) do
                     remove_tab(sid)
                 end
@@ -398,9 +450,11 @@ local function main(config)
                         remove_tab(sid)
                     end
                     monitored_pids[owner] = nil
+                    drain_buffered()
 
                     -- A tab was freed, serve waiting requests
                     serve_next_waiter()
+                    drain_buffered()
                 end
             end
 
@@ -423,6 +477,7 @@ local function main(config)
                 })
             else
                 do_create_tab(tab_opts, sender)
+                drain_buffered()
             end
 
         elseif r.channel == ch_command then
@@ -431,15 +486,19 @@ local function main(config)
             local sid = payload.sid
             local method = payload.method
             local params = payload.params or {}
-            local timeout = payload.timeout
 
             if not tabs[sid] then
                 process.send(sender, "tab.command.reply", { result = nil, error = "TAB_CLOSED: Tab session not found" })
             elseif not conn:is_alive() then
                 process.send(sender, "tab.command.reply", { result = nil, error = "CDP_DISCONNECTED: Chrome connection lost" })
             else
-                local result, err = conn:send(method, params, sid, timeout)
-                process.send(sender, "tab.command.reply", { result = result, error = err })
+                -- Non-blocking: send command, track by ID, response routed via ws_ch handler
+                local cmd_id, send_err = conn:send_async(method, params, sid)
+                if send_err then
+                    process.send(sender, "tab.command.reply", { result = nil, error = send_err })
+                else
+                    pending[cmd_id :: integer] = { sender = sender, method = method }
+                end
             end
 
         elseif r.channel == ch_close then
@@ -448,6 +507,7 @@ local function main(config)
 
             if tabs[sid] then
                 remove_tab(sid)
+                drain_buffered()
                 log:info("Tab closed", {
                     session_id = sid,
                     active_tabs = active_tab_count,
@@ -455,6 +515,7 @@ local function main(config)
 
                 -- A tab was freed, serve waiting requests
                 serve_next_waiter()
+                drain_buffered()
             end
 
         else

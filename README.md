@@ -19,6 +19,12 @@ processes, get N concurrent browser sessions.
 - **Connection pooling** — max tabs enforcement with backpressure and automatic queuing
 - **Fault tolerance** — automatic Chrome disconnect detection, tab cleanup on process exit, supervisor-friendly
 
+## Documentation
+
+- [API Reference](docs/api-reference.md) — full method signatures, parameters, return types, and examples
+- [Architecture](docs/architecture.md) — process model, navigation flow, message protocol, tab lifecycle
+- [Error Handling](docs/error-handling.md) — error types, CDP error mapping, handling patterns
+
 ## Requirements
 
 - Wippy runtime
@@ -122,195 +128,132 @@ return { main = main }
 
 ## API Reference
 
-### Module: `browser`
+See the full [API Reference](docs/api-reference.md) for all methods with parameters, return types, and examples.
+
+### Quick Overview
 
 ```lua
 local browser = require("browser")
-```
+local tab, err = browser.new_tab()
 
-#### `browser.new_tab(registry_name?, options?) → Tab, error?`
+-- Navigation
+tab:goto(url)                    tab:reload()
+tab:back()                       tab:forward()
+tab:url()                        tab:wait_for_navigation()
 
-Creates a new browser tab connected to the CDP instance. The tab is an isolated browsing context (incognito-like).
-Blocks if the max tab limit is reached, returning an error on timeout.
+-- Waiting
+tab:wait_for_selector(sel)       tab:wait_for_function(js_fn)
+tab:wait_for_network_idle()
 
-```lua
-local tab, err = browser.new_tab("app:chrome")
-if err then return nil, err end
+-- Content extraction
+tab:content()                    tab:text(sel)
+tab:text_all(sel)                tab:attribute(sel, attr)
+tab:attribute_all(sel, attr)     tab:value(sel)
+tab:is_visible(sel)              tab:exists(sel)
+tab:is_enabled(sel)              tab:is_checked(sel)
+tab:count(sel)
 
--- Use tab...
-tab:close()
+-- Interaction
+tab:click(sel)                   tab:type(sel, text)
+tab:press(key)                   tab:select(sel, value)
+tab:check(sel)                   tab:uncheck(sel)
+tab:hover(sel)                   tab:focus(sel)
+tab:upload(sel, path)
+
+-- JavaScript
+tab:eval(expr, ...)              tab:eval_async(expr)
+
+-- Capture
+tab:screenshot()                 tab:pdf()
+tab:expect_download(fn)
+
+-- Configuration
+tab:set_viewport(w, h)           tab:set_user_agent(ua)
+tab:set_headers(h)               tab:set_timeout(t)
+tab:block_resources(types)
+
+-- Lifecycle
+tab:close()                      tab:is_alive()
+tab:session_id()
+
+-- Low-level
+tab:send_command(method, params)
 ```
 
 ---
 
-### Object: `Tab`
+## How Navigation Works
 
-All operations block the calling coroutine (not the process) until complete or timeout.
+This section explains what happens internally when you call `tab:goto(url)`. Understanding the flow helps with debugging
+and tuning timeouts.
 
-#### Navigation
+### Processes Involved
 
-```lua
--- Navigate to URL (blocks until page load event)
-local response, err = tab:goto("https://example.com")
--- response.url, response.frame_id, response.loader_id
+| Process                | Role                                                                 |
+|------------------------|----------------------------------------------------------------------|
+| **User process**       | Your Lua code. Holds a `Tab` object (lightweight handle)             |
+| **Connection Manager** | Singleton service (`headless.manager`). Owns the WebSocket to Chrome |
+| **Chrome**             | Headless Chromium. Executes page loads via CDP                       |
 
-tab:reload()
-tab:back()
-tab:forward()
+### Flow
 
-local url = tab:url()
-
--- Wait for navigation after an action that triggers it
-local response, err = tab:wait_for_navigation()
+```
+User Process              Manager Process            Chrome (CDP)
+     │                         │                          │
+     │  tab:goto(url)          │                          │
+     │                         │                          │
+     │  ─"tab.command"───────> │                          │
+     │   method=Page.navigate  │                          │
+     │   params={url=...}      │                          │
+     │   [blocks on reply]     │                          │
+     │                         │  conn:send(JSON-RPC)     │
+     │                         │  ──────────────────────> │
+     │                         │                          │  start loading page
+     │                         │  <── {id, result} ────── │
+     │                         │                          │
+     │  <─"tab.command.reply"─ │                          │
+     │   result.frameId        │                          │
+     │   result.loaderId       │                          │
+     │                         │                          │
+     │  wait_for_event(        │                          │
+     │   "Page.loadEventFired")│                          │
+     │  [blocks on cdp_event]  │                          │  page finishes loading
+     │                         │                          │
+     │                         │  <── Page.loadEventFired │
+     │                         │  (event dispatched to    │
+     │                         │   session subscriber)    │
+     │                         │                          │
+     │  <─"tab.cdp_event"───── │                          │
+     │   Page.loadEventFired   │                          │
+     │                         │                          │
+     │  return {url,           │                          │
+     │    frame_id, loader_id} │                          │
 ```
 
-#### Waiting
+**Step by step:**
 
-```lua
--- Wait for element to appear in DOM
-local ok, err = tab:wait_for_selector("#result", {
-    timeout = "10s",
-    visible = true,      -- wait until visible, not just in DOM
-})
+1. `tab:goto(url)` calls `tab:send_command("Page.navigate", {url})`, which sends a `"tab.command"` message to the
+   connection manager via `process.send()` and blocks the user process waiting for a `"tab.command.reply"`.
 
--- Wait for a JS condition to become truthy
-tab:wait_for_function("() => document.querySelectorAll('.item').length > 5", {
-    timeout = "15s",
-})
+2. The manager receives the command in its event loop, verifies the session is valid, and forwards it to Chrome through
+   the CDP WebSocket as a JSON-RPC message.
 
--- Wait for no network requests for 500ms
-tab:wait_for_network_idle({
-    idle_time = 500,     -- ms
-    timeout = "30s",
-})
-```
+3. Chrome starts loading the page and immediately responds with a result containing `frameId` and `loaderId`. The
+   manager forwards this response back to the user process.
 
-#### Content Extraction
+4. `tab:goto()` then calls `wait_for_event("Page.loadEventFired")`, which blocks the user process again, now waiting for
+   a `"tab.cdp_event"` message.
 
-```lua
-local html = tab:content()                            -- full page HTML
-local text = tab:text("#message")                     -- element text
-local items = tab:text_all(".result .title")          -- multiple elements
-local href = tab:attribute("a.link", "href")          -- attribute value
-local links = tab:attribute_all(".nav a", "href")     -- multiple attributes
-local val = tab:value("#search-input")                -- input/select value
-local visible = tab:is_visible("#error")              -- boolean
-local exists = tab:exists("#captcha")                 -- boolean
-local enabled = tab:is_enabled("#submit")             -- boolean
-local checked = tab:is_checked("#remember-me")        -- boolean
-local count = tab:count(".search-result")             -- integer
-```
+5. When Chrome finishes loading the page, it emits a `Page.loadEventFired` event over the WebSocket. The CDP connection
+   dispatches it to the session's subscriber channel. The manager picks it up and forwards it to the tab's owner
+   process.
 
-#### Element Interaction
+6. The tab receives the event, and `tab:goto()` returns `{ url, frame_id, loader_id }` to the caller.
 
-```lua
-tab:click("#submit-button")
+If anything fails — DNS error, SSL error, timeout — an error string is returned instead.
+See [Error Handling](docs/error-handling.md) for all error types.
 
--- Type into input (clears first by default)
-tab:type("#search", "query text")
-tab:type("#search", " more", { clear = false })    -- append
-
-tab:press("Enter")
-tab:press("Tab")
-tab:press("Escape")
-
--- Select dropdown
-tab:select("#country", "RU")                        -- by value
-tab:select("#country", { index = 3 })               -- by index
-tab:select("#country", { text = "Russia" })         -- by visible text
-
-tab:check("#agree-terms")
-tab:uncheck("#newsletter")
-tab:hover("#tooltip-trigger")
-tab:focus("#input-field")
-
--- File upload
-tab:upload("#file-input", "/path/to/file.pdf")
-```
-
-#### JavaScript Execution
-
-```lua
--- Evaluate expression, get return value
-local title = tab:eval("document.title")
-local count = tab:eval("document.querySelectorAll('.item').length")
-
--- With arguments (expression treated as function)
-local text = tab:eval(
-    "(selector) => document.querySelector(selector)?.textContent",
-    "#my-element"
-)
-
--- Async (waits for Promise resolution)
-local data = tab:eval_async([[
-    const resp = await fetch('/api/data');
-    return await resp.json();
-]])
-```
-
-#### Screenshots & PDF
-
-```lua
--- Viewport screenshot (PNG)
-local png = tab:screenshot()
-
--- Element screenshot
-local png = tab:screenshot("#chart")
-
--- Full scrollable page
-local png = tab:screenshot({ full_page = true })
-
--- JPEG with quality
-local jpg = tab:screenshot({ format = "jpeg", quality = 80 })
-
--- PDF generation
-local pdf = tab:pdf()
-local pdf = tab:pdf({
-    format = "A4",            -- A3, A4, A5, Letter, Legal, Tabloid
-    landscape = true,
-    print_background = true,
-    margin = { top = "1cm", bottom = "1cm", left = "2cm", right = "2cm" },
-})
-```
-
-#### File Downloads
-
-Downloads are intercepted in-memory via the Fetch domain — no disk I/O required.
-
-```lua
-local download, err = tab:expect_download(function()
-    tab:click("#download-pdf-button")
-end, { timeout = "30s" })
-
-if err then return nil, err end
-
--- download.data      → raw bytes (string)
--- download.filename  → "report.pdf"
--- download.mime_type → "application/pdf"
--- download.size      → 145832
-```
-
-#### Tab Configuration
-
-```lua
-tab:set_viewport(1280, 720)
-tab:set_user_agent("Mozilla/5.0 ...")
-tab:set_headers({
-    ["Accept-Language"] = "ru-RU,ru;q=0.9",
-})
-tab:set_timeout("15s")
-
--- Block resource types for faster scraping
-tab:block_resources({"image", "stylesheet", "font", "media"})
-```
-
-#### Lifecycle
-
-```lua
-tab:close()
-tab:is_alive()    -- boolean
-tab:session_id()  -- CDP session ID
-```
+For a deeper dive into the architecture, message protocol, and tab lifecycle, see [Architecture](docs/architecture.md).
 
 ---
 
@@ -383,29 +326,20 @@ local tab, err = browser.new_tab("app:chrome")
 
 ## Error Handling
 
-### Error Types
+All fallible functions return `(value?, string?)`. Error strings follow the format `ERROR_TYPE: description`.
 
-| Error Type                 | Description                                     |
-|----------------------------|-------------------------------------------------|
-| `CDP_CONNECTION_FAILED`    | Cannot connect to Chrome or manager not running |
-| `CDP_DISCONNECTED`         | Chrome connection lost during operation         |
-| `CDP_ERROR`                | Generic CDP protocol error                      |
-| `NAVIGATION_FAILED`        | Page navigation error (DNS, SSL, etc.)          |
-| `ELEMENT_NOT_FOUND`        | CSS selector matched no elements                |
-| `ELEMENT_NOT_VISIBLE`      | Element exists but is hidden                    |
-| `ELEMENT_NOT_INTERACTABLE` | Element is covered or not interactive           |
-| `EVAL_ERROR`               | JavaScript execution error                      |
-| `DOWNLOAD_TIMEOUT`         | No download started within timeout              |
-| `DOWNLOAD_FAILED`          | Download cancelled or body unreadable           |
-| `MAX_TABS_REACHED`         | Tab pool exhausted and timeout expired          |
-| `TAB_CLOSED`               | Tab was closed, crashed, or context destroyed   |
-| `TIMEOUT`                  | Operation exceeded its timeout                  |
-
-### Patterns
+| Error Type              | Description                                     |
+|-------------------------|-------------------------------------------------|
+| `CDP_CONNECTION_FAILED` | Cannot connect to Chrome or manager not running |
+| `CDP_DISCONNECTED`      | Chrome connection lost during operation         |
+| `NAVIGATION_FAILED`     | Page navigation error (DNS, SSL, etc.)          |
+| `ELEMENT_NOT_FOUND`     | CSS selector matched no elements                |
+| `EVAL_ERROR`            | JavaScript execution error                      |
+| `TAB_CLOSED`            | Tab was closed, crashed, or context destroyed   |
+| `TIMEOUT`               | Operation exceeded its timeout                  |
 
 ```lua
--- Expected failures: check error returns
-local tab, err = browser.new_tab("app:chrome")
+local tab, err = browser.new_tab()
 if err then return nil, err end
 
 local resp, err = tab:goto("https://example.com")
@@ -413,11 +347,9 @@ if err then
     tab:close()
     return nil, err
 end
-
--- Unexpected failures: let it crash
--- If Chrome crashes mid-operation, the process crashes,
--- and the supervisor restarts it with clean state.
 ```
+
+See [Error Handling](docs/error-handling.md) for the full list, CDP error mapping, and handling patterns.
 
 ---
 
@@ -454,6 +386,9 @@ The connection manager is a long-running Wippy process that:
 - Monitors tab owner PIDs and auto-cleans on process exit
 - Runs periodic health checks and attempts reconnection on disconnect
 - Enforces max tab limits with a waiter queue
+
+See [Architecture](docs/architecture.md) for the full process model, message protocol, tab lifecycle, and health check
+details.
 
 ---
 

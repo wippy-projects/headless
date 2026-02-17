@@ -246,6 +246,28 @@ function connection.new(address: string, options: table?): (table?, string?)
         return true, nil
     end
 
+    --- Send a CDP command and return the command ID without waiting for the response.
+    --- The caller is responsible for matching the response by ID (e.g. via pump_message).
+    --- @param method string CDP method (e.g. "Page.navigate")
+    --- @param params table|nil Command parameters
+    --- @param session_id string|nil Target session ID
+    --- @return integer|nil id Command ID for matching the response
+    --- @return string|nil error
+    function self:send_async(method: string, params: table?, session_id: string?): (integer?, string?)
+        if closed then
+            return nil, "CDP connection is closed"
+        end
+
+        local encoded, id = proto:encode_command(method, params, session_id)
+
+        local ok, send_err = ws:send(encoded)
+        if send_err then
+            return nil, "CDP send failed: " .. tostring(send_err)
+        end
+
+        return id, nil
+    end
+
     --- Subscribe to CDP events for a specific session.
     --- Returns a buffered channel that receives event messages.
     --- @param session_id string Session ID to subscribe to
@@ -286,17 +308,20 @@ function connection.new(address: string, options: table?): (table?, string?)
     end
 
     --- Process a WebSocket message already received from ws_channel().
-    --- Dispatches events to subscribers and buffers responses.
+    --- Dispatches events to subscribers. Returns decoded response/error
+    --- for the caller to route (e.g. to a pending async command).
     --- @param msg table The WebSocket message from channel.select r.value
-    function self:pump_message(msg: table)
+    --- @return table|nil response Decoded response or error table, nil for events
+    function self:pump_message(msg: table): table?
         if msg.type == "text" and msg.data then
             local decoded = proto:decode_message(msg.data :: string)
             if decoded.type == "response" or decoded.type == "error" then
-                buffered_responses[decoded.id] = decoded
+                return decoded
             elseif decoded.type == "event" then
                 dispatch_event(decoded)
             end
         end
+        return nil
     end
 
     --- Check if the connection is still alive.
@@ -309,6 +334,19 @@ function connection.new(address: string, options: table?): (table?, string?)
     --- @return string
     function self:ws_url(): string
         return ws_url
+    end
+
+    --- Get and clear all buffered responses.
+    --- Used after blocking conn:send() calls to retrieve responses for
+    --- async commands that arrived while send() was pumping the WebSocket.
+    --- @return {table} responses Array of decoded response/error tables
+    function self:drain_responses(): {table}
+        local resps: {table} = {}
+        for _, resp in pairs(buffered_responses) do
+            table.insert(resps, resp)
+        end
+        buffered_responses = {}
+        return resps
     end
 
     --- Close the CDP connection. Cleans up WebSocket and all channels.

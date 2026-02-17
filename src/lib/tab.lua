@@ -22,6 +22,39 @@ local error_map = require("errors")
 
 local tab_mod = {}
 
+--- Content types that indicate a file download (binary/document types).
+--- Used in expect_download to detect downloads that lack content-disposition: attachment.
+local DOWNLOAD_CONTENT_TYPES = {
+    ["application/pdf"] = true,
+    ["application/octet-stream"] = true,
+    ["application/zip"] = true,
+    ["application/x-zip-compressed"] = true,
+    ["application/x-rar-compressed"] = true,
+    ["application/x-7z-compressed"] = true,
+    ["application/x-download"] = true,
+    ["application/force-download"] = true,
+    ["application/x-msdownload"] = true,
+    ["application/vnd.ms-excel"] = true,
+    ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] = true,
+    ["application/msword"] = true,
+    ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"] = true,
+}
+
+--- Internal: build Fetch patterns for blocked resource types.
+--- Returns per-type Request-stage patterns to avoid intercepting the document.
+--- @param blocked_resources table Set of CDP resource type names
+--- @return {table} patterns
+local function build_blocked_patterns(blocked_resources: table): {table}
+    local patterns = {}
+    for resource_type, _ in pairs(blocked_resources) do
+        table.insert(patterns, {
+            resourceType = resource_type,
+            requestStage = "Request",
+        })
+    end
+    return patterns
+end
+
 --- Internal: process a Fetch.requestPaused event for resource blocking.
 --- Sends Fetch.failRequest or Fetch.continueRequest as appropriate.
 --- Returns true if the event was handled, false otherwise.
@@ -991,11 +1024,11 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
         -- and download interception (Response stage)
         local patterns = {{ requestStage = "Response" }}
         if self._blocked_resources then
-            -- Already blocking resources at Request stage — need both stages
-            patterns = {
-                { requestStage = "Request" },
-                { requestStage = "Response" },
-            }
+            -- Already blocking resources at Request stage — need both stages.
+            -- Use per-type patterns to avoid intercepting the document request.
+            local blocked_patterns: {table} = build_blocked_patterns(self._blocked_resources)
+            table.insert(blocked_patterns, { requestStage = "Response" })
+            patterns = blocked_patterns
         end
 
         -- Re-enable Fetch with combined patterns
@@ -1012,8 +1045,13 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
             eventsEnabled = true,
         })
 
-        -- Execute the action that triggers the download
-        action_fn()
+        -- Execute the action that triggers the download.
+        -- If action_fn returns (nil, error), fail immediately.
+        local action_ok, action_err = action_fn()
+        if action_err and type(action_err) == "string" then
+            self:_restore_fetch_state()
+            return nil, "DOWNLOAD_FAILED: Action failed: " .. (action_err :: string)
+        end
 
         -- Wait for Fetch.requestPaused with download content
         local deadline = time.after(timeout)
@@ -1051,9 +1089,23 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
                             if header.value:find("attachment") then
                                 is_download = true
                             end
-                            filename = header.value:match('filename="?([^";\n]+)"?')
+                            local fname = header.value:match('filename="?([^";\n]+)"?')
+                            if fname then
+                                filename = fname
+                                -- Content-Disposition with filename is a strong download signal
+                                is_download = true
+                            end
                         elseif name_lower == "content-type" then
                             mime_type = header.value:match("^([^;]+)")
+                        end
+                    end
+
+                    -- Detect downloads by content-type (e.g. PDF served without
+                    -- content-disposition header, which is common on nalog.ru etc.)
+                    if not is_download and mime_type then
+                        local ct = mime_type:lower():match("^%s*(.-)%s*$") or ""
+                        if (DOWNLOAD_CONTENT_TYPES :: table)[ct] then
+                            is_download = true
                         end
                     end
 
@@ -1092,6 +1144,14 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
 
                         self:_restore_fetch_state()
 
+                        -- Derive filename from URL if not provided by Content-Disposition
+                        if not filename and params.request and params.request.url then
+                            local url_path = (params.request.url :: string):match("([^/]+)$")
+                            if url_path then
+                                filename = url_path:match("^([^?#]+)") or url_path
+                            end
+                        end
+
                         return {
                             data = data,
                             filename = filename or "download",
@@ -1111,7 +1171,7 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
                     process_fetch_event(self, evt :: table)
                 end
             end
-            -- Other events (Page.downloadWillBegin, etc.) are consumed and ignored
+            -- Non-Fetch events (Network.*, Page.*, etc.) are consumed and ignored
         end
     end
 
@@ -1119,11 +1179,13 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
     --- Re-enables resource blocking if it was active, otherwise disables Fetch.
     function self:_restore_fetch_state()
         if self._blocked_resources then
-            -- Re-enable Fetch for resource blocking only (Request stage)
+            -- Re-enable Fetch for resource blocking only (Request stage).
+            -- Use per-type patterns to avoid intercepting the document request.
+            local patterns = build_blocked_patterns(self._blocked_resources)
             pcall(function() self:send_command("Fetch.disable", {}) end)
             pcall(function()
                 self:send_command("Fetch.enable", {
-                    patterns = {{ requestStage = "Request" }},
+                    patterns = patterns,
                 })
             end)
         else
@@ -1205,9 +1267,21 @@ function tab_mod.new(manager_pid: string, session_id: string, target_id: string,
 
         self._blocked_resources = blocked
 
-        -- Enable Fetch interception at Request stage
+        -- Enable Fetch interception at Request stage for specific resource types only.
+        -- Using per-type patterns avoids intercepting the main document request,
+        -- which would deadlock Page.navigate (Chrome waits for Fetch.continueRequest
+        -- before responding, but nobody can handle it while send_command blocks).
+        local patterns = {}
+        for _, t in ipairs(resource_types) do
+            local mapped: string = (type_map :: table)[t] or t
+            table.insert(patterns, {
+                resourceType = mapped,
+                requestStage = "Request",
+            })
+        end
+
         local _, err = self:send_command("Fetch.enable", {
-            patterns = {{ requestStage = "Request" }},
+            patterns = patterns,
         })
         if err then return nil, err end
 
