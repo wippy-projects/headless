@@ -9,12 +9,14 @@ processes, get N concurrent browser sessions.
 ## Features
 
 - **Tab-per-process isolation** — incognito-like browser contexts with independent cookies, storage, and cache
+- **Non-blocking connection manager** — async CDP command routing, concurrent tabs never block each other
 - **Full navigation control** — goto, reload, back/forward, wait for load/network idle
 - **Element interaction** — click, type, select dropdowns, check/uncheck, hover, focus, upload files
 - **Content extraction** — text, attributes, values, visibility checks, element counting
 - **JavaScript execution** — sync and async eval with argument passing
 - **Screenshots & PDF** — viewport, element, full-page screenshots; PDF generation with paper size and margin options
-- **Download interception** — capture file downloads in-memory without disk I/O
+- **Download interception** — capture file downloads in-memory without disk I/O, detects by content-disposition and
+  content-type (PDF, ZIP, binary, etc.)
 - **Resource blocking** — block images, stylesheets, fonts, etc. for faster scraping
 - **Connection pooling** — max tabs enforcement with backpressure and automatic queuing
 - **Fault tolerance** — automatic Chrome disconnect detection, tab cleanup on process exit, supervisor-friendly
@@ -206,11 +208,13 @@ User Process              Manager Process            Chrome (CDP)
      │   method=Page.navigate  │                          │
      │   params={url=...}      │                          │
      │   [blocks on reply]     │                          │
-     │                         │  conn:send(JSON-RPC)     │
+     │                         │  conn:send_async(...)    │
      │                         │  ──────────────────────> │
-     │                         │                          │  start loading page
-     │                         │  <── {id, result} ────── │
+     │                         │  (non-blocking, manager  │  start loading page
+     │                         │   continues event loop)  │
      │                         │                          │
+     │                         │  <── {id, result} ────── │
+     │                         │  route_response() →      │
      │  <─"tab.command.reply"─ │                          │
      │   result.frameId        │                          │
      │   result.loaderId       │                          │
@@ -235,11 +239,12 @@ User Process              Manager Process            Chrome (CDP)
 1. `tab:goto(url)` calls `tab:send_command("Page.navigate", {url})`, which sends a `"tab.command"` message to the
    connection manager via `process.send()` and blocks the user process waiting for a `"tab.command.reply"`.
 
-2. The manager receives the command in its event loop, verifies the session is valid, and forwards it to Chrome through
-   the CDP WebSocket as a JSON-RPC message.
+2. The manager receives the command in its event loop and forwards it to Chrome via `conn:send_async()` — a non-blocking
+   call that sends the CDP command and tracks the response by ID. The manager's event loop continues processing other
+   events immediately.
 
-3. Chrome starts loading the page and immediately responds with a result containing `frameId` and `loaderId`. The
-   manager forwards this response back to the user process.
+3. Chrome starts loading the page and responds with a result containing `frameId` and `loaderId`. The manager receives
+   the response on the WebSocket channel, matches it to the pending command, and forwards it to the user process.
 
 4. `tab:goto()` then calls `wait_for_event("Page.loadEventFired")`, which blocks the user process again, now waiting for
    a `"tab.cdp_event"` message.
@@ -254,6 +259,43 @@ If anything fails — DNS error, SSL error, timeout — an error string is retur
 See [Error Handling](docs/error-handling.md) for all error types.
 
 For a deeper dive into the architecture, message protocol, and tab lifecycle, see [Architecture](docs/architecture.md).
+
+---
+
+## Download Interception
+
+`expect_download` intercepts file downloads in-memory by pausing responses at the CDP Fetch layer.
+
+### Detection
+
+A response is recognized as a download if any of these conditions are met:
+
+- `Content-Disposition` header contains `attachment` or a `filename` parameter
+- `Content-Type` is a known binary/document type: `application/pdf`, `application/octet-stream`, `application/zip`, etc.
+
+### Error Propagation
+
+If the action function returns an error (e.g. element not found), `expect_download` fails immediately instead of
+waiting for timeout. Use `return` in the action function:
+
+```lua
+local dl, err = tab:expect_download(function()
+    return tab:click("#download-btn")
+end, { timeout = "30s" })
+```
+
+### JavaScript Click
+
+For buttons with JavaScript event handlers, use `tab:eval()` to trigger the click directly — CDP mouse events may not
+always fire JS handlers:
+
+```lua
+local dl, err = tab:expect_download(function()
+    return tab:eval([[
+        document.querySelector('#download-btn').click()
+    ]])
+end, { timeout = "30s" })
+```
 
 ---
 
@@ -337,6 +379,8 @@ All fallible functions return `(value?, string?)`. Error strings follow the form
 | `EVAL_ERROR`            | JavaScript execution error                      |
 | `TAB_CLOSED`            | Tab was closed, crashed, or context destroyed   |
 | `TIMEOUT`               | Operation exceeded its timeout                  |
+| `DOWNLOAD_TIMEOUT`      | No download detected within timeout             |
+| `DOWNLOAD_FAILED`       | Download action or body retrieval failed        |
 
 ```lua
 local tab, err = browser.new_tab()
@@ -367,7 +411,7 @@ See [Error Handling](docs/error-handling.md) for the full list, CDP error mappin
 │                ▼               ▼                             │
 │       ┌─────────────────────────────────┐                    │
 │       │    Connection Manager Process    │                    │
-│       │    (CDP WebSocket + tab pool)    │                    │
+│       │  (non-blocking CDP + tab pool)  │                    │
 │       └───────────────┬─────────────────┘                    │
 └───────────────────────┼──────────────────────────────────────┘
                         │ WebSocket (CDP)
@@ -381,6 +425,8 @@ See [Error Handling](docs/error-handling.md) for the full list, CDP error mappin
 The connection manager is a long-running Wippy process that:
 
 - Owns the single WebSocket connection to Chrome
+- **Non-blocking command routing** — sends CDP commands via `send_async()`, tracks responses by ID, routes replies when
+  they arrive on the WebSocket. The event loop never blocks on individual commands.
 - Multiplexes CDP sessions by `sessionId`
 - Routes commands from Tab objects via `process.send` + channels
 - Monitors tab owner PIDs and auto-cleans on process exit
@@ -394,56 +440,72 @@ details.
 
 ## Real-World Example: EGRUL Document Extraction
 
+Extract company registration documents from egrul.nalog.ru by INN:
+
 ```lua
 local browser = require("browser")
-local store = require("store")
+local fs = require("fs")
 local logger = require("logger")
 
 local function extract_egrul(inn)
-    local tab, err = browser.new_tab("app:chrome")
+    local log = logger:named("egrul")
+    local tab, err = browser.new_tab()
     if err then return nil, err end
 
-    local resp, err = tab:goto("https://egrul.nalog.ru/index.html")
-    if err then
+    -- Block unnecessary resources for faster loading
+    tab:block_resources({"image", "font", "media"})
+
+    local _, nav_err = tab:goto("https://egrul.nalog.ru/index.html")
+    if nav_err then
         tab:close()
-        return nil, err
+        return nil, nav_err
     end
 
-    -- Block unnecessary resources
-    tab:block_resources({"image", "stylesheet", "font"})
-
-    -- Fill search
-    tab:wait_for_selector("#query")
+    -- Fill search form
+    tab:wait_for_selector("#query", { timeout = "15s", visible = true })
     tab:type("#query", inn)
     tab:click("#btnSearch")
 
     -- Wait for results
-    tab:wait_for_selector(".res-row", { timeout = "15s" })
+    tab:wait_for_selector(".res-row", { timeout = "20s", visible = true })
+    local company_name = tab:text(".res-row:first-child .res-caption a")
 
-    -- Download PDF
-    local download, err = tab:expect_download(function()
-        tab:click(".res-row:first-child .op-excerpt a")
-    end, { timeout = "30s" })
+    -- Download PDF — use JS click to reliably trigger the handler
+    local download, dl_err = tab:expect_download(function()
+        return tab:eval([[
+            (function() {
+                var btn = document.querySelector('.res-row:first-child button.op-excerpt');
+                if (!btn) throw new Error('Button not found');
+                btn.click();
+                return true;
+            })()
+        ]])
+    end, { timeout = "60s" })
 
-    if err then
-        logger:warn("Download failed", { inn = inn, error = tostring(err) })
+    if dl_err then
         tab:close()
-        return nil, err
+        return nil, dl_err
     end
 
-    -- Save to store
-    local s = store.get("app:documents")
-    local key = string.format("egrul/%s/%s", inn, download.filename)
-    s:set(key, download.data)
-    s:release()
+    -- Save PDF to filesystem
+    local vol = fs.get("app:downloads")
+    vol:mkdir("/egrul")
+    vol:mkdir("/egrul/" .. inn)
+    vol:writefile("/egrul/" .. inn .. "/" .. download.filename, download.data, "w")
 
     tab:close()
+    log:info("Extraction complete", {
+        inn = inn,
+        company = company_name,
+        file = download.filename,
+        size = download.size,
+    })
 
     return {
         inn = inn,
+        company_name = company_name,
         filename = download.filename,
         size = download.size,
-        store_key = key,
     }
 end
 
