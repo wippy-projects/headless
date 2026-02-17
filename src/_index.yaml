@@ -1,0 +1,29 @@
+version: "1.0"
+namespace: headless
+
+entries:
+  - name: definition
+    kind: ns.definition
+    readme: file://README.md
+    meta:
+      title: Headless Browser SDK
+      description: Low-level browser automation via Chrome DevTools Protocol
+
+  # --- Requirements ---
+
+  - name: chrome_address
+    kind: ns.requirement
+    meta:
+      description: Chrome CDP address (host:port)
+    default: "localhost:9222"
+
+  - name: process_host
+    kind: ns.requirement
+    meta:
+      description: Process host for headless browser services
+    default: app:processes
+    targets:
+      - entry: headless.service:connection_manager.service
+        path: .host
+      - entry: headless.service:connection_manager.service
+        path: .lifecycle.depends_on[0]

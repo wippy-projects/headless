@@ -1,0 +1,30 @@
+version: "1.0"
+namespace: headless.service
+
+entries:
+  - name: connection_manager
+    kind: process.lua
+    source: file://connection_manager.lua
+    method: main
+    modules:
+      - json
+      - time
+      - websocket
+      - http_client
+      - logger
+      - env
+    imports:
+      cdp_connection: headless.lib:cdp_connection
+
+  - name: connection_manager.service
+    kind: process.service
+    process: connection_manager
+    host: app:processes
+    lifecycle:
+      auto_start: true
+      depends_on:
+        - app:processes
+      restart:
+        max_attempts: 5
+        initial_delay: 2s
+        backoff_factor: 2.0

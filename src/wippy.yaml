@@ -1,0 +1,11 @@
+organization: butschster
+module: headless-browser
+description: Low-level browser automation SDK via Chrome DevTools Protocol (CDP)
+license: MIT
+keywords:
+  - browser
+  - headless
+  - cdp
+  - chrome
+  - automation
+  - scraping

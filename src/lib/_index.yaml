@@ -1,0 +1,53 @@
+version: "1.0"
+namespace: headless.lib
+
+entries:
+  - name: cdp_protocol
+    kind: library.lua
+    source: file://cdp_protocol.lua
+    modules:
+      - json
+
+  - name: cdp_connection
+    kind: library.lua
+    source: file://cdp_connection.lua
+    modules:
+      - websocket
+      - http_client
+      - json
+      - time
+    imports:
+      cdp_protocol: headless.lib:cdp_protocol
+
+  - name: cdp_helpers
+    kind: library.lua
+    source: file://cdp_helpers.lua
+    modules:
+      - time
+
+  - name: dom_helpers
+    kind: library.lua
+    source: file://dom_helpers.lua
+
+  - name: errors
+    kind: library.lua
+    source: file://errors.lua
+
+  - name: tab
+    kind: library.lua
+    source: file://tab.lua
+    modules:
+      - time
+      - base64
+    imports:
+      cdp_helpers: headless.lib:cdp_helpers
+      dom_helpers: headless.lib:dom_helpers
+      errors: headless.lib:errors
+
+  - name: browser
+    kind: library.lua
+    source: file://browser.lua
+    modules:
+      - time
+    imports:
+      tab: headless.lib:tab
