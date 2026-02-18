@@ -38,20 +38,23 @@ src/
 
 ## Architecture
 
-- **Connection Manager** (`service/connection_manager.lua`) — singleton process registered as `headless.manager`, owns the CDP WebSocket, multiplexes sessions, enforces max tabs
+- **Connection Manager** (`service/connection_manager.lua`) — singleton process registered as `headless.manager`, owns
+  the CDP WebSocket, multiplexes sessions, enforces max tabs
 - **Tab** (`lib/tab.lua`) — user-facing object, communicates with manager via `process.send` + reply channels
 - **Browser** (`lib/browser.lua`) — thin public API, looks up manager via `process.registry`, creates tabs
 
-Message flow: `Tab:send_command()` → `process.send(manager, "tab.command", ...)` → manager calls `conn:send()` → replies via `process.send(sender, "tab.command.reply", ...)`
+Message flow: `Tab:send_command()` → `process.send(manager, "tab.command", ...)` → manager calls `conn:send()` → replies
+via `process.send(sender, "tab.command.reply", ...)`
 
 ## Type System Conventions
 
 - Types are **non-nullable by default**; use `?` suffix for optional (`string?`, `table?`)
-- Use `:: type` casts when the linter can't infer narrowed types (e.g. after nil checks, from `any`/`unknown` table fields)
+- Use `:: type` casts when the linter can't infer narrowed types (e.g. after nil checks, from `any`/`unknown` table
+  fields)
 - Common patterns requiring casts:
-  - `r.value` from `channel.select` is `any` — cast fields: `r.value.field :: string`
-  - `result.field` from `send_command` returns `table?` — inner fields are `unknown`
-  - Multi-return `eval()` returning `(any?, string?)` needs unwrap + cast when caller expects `(string?, string?)`
+    - `r.value` from `channel.select` is `any` — cast fields: `r.value.field :: string`
+    - `result.field` from `send_command` returns `table?` — inner fields are `unknown`
+    - Multi-return `eval()` returning `(any?, string?)` needs unwrap + cast when caller expects `(string?, string?)`
 - Function signatures use typed params: `function foo(x: string, y: table?): (string?, string?)`
 - Type annotations on locals: `local x: number = tonumber(s) or 0`
 
@@ -66,6 +69,7 @@ Message flow: `Tab:send_command()` → `process.send(manager, "tab.command", ...
 
 - **Error handling**: all fallible functions return `(value?, string?)` — check error before using value
 - **Process communication**: `process.send(pid, topic, payload)` + `process.listen(topic)` + `channel.select`
-- **CDP commands**: routed through `Tab:send_command(method, params?, timeout?)`, never called directly on the connection
+- **CDP commands**: routed through `Tab:send_command(method, params?, timeout?)`, never called directly on the
+  connection
 - **Event waiting**: `channel.select` with timeout channels from `time.after(duration_string)`
 - **Resource cleanup**: tabs auto-clean on owner process exit via `process.monitor` + EXIT events
